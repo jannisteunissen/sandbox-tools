@@ -332,19 +332,17 @@ is applied the overlay is discarded; otherwise it is kept."
   "Face for hidden paths in *sandbox apply*."
   :group 'sandbox-tools)
 
-(defface sandbox-tools-group '((t :inherit (bold font-lock-comment-face)))
-  "Face for group headings in *sandbox apply*."
-  :group 'sandbox-tools)
-
 (defvar-local sandbox-tools--sel-items nil "Items shown in *sandbox apply*.")
 (defvar-local sandbox-tools--sel-root nil "Project root for *sandbox apply*.")
 (defvar-local sandbox-tools--sel-staging nil "Staging directory for *sandbox apply*.")
 
 (defconst sandbox-tools-select-keys
   '(("SPC"     sandbox-tools-select-toggle       "toggle")
-    ("g"       sandbox-tools-select-toggle-group "group")
     ("a"       sandbox-tools-select-all          "all")
     ("N"       sandbox-tools-select-none         "none")
+    ("m"       sandbox-tools-select-mark-region   "mark region")
+    ("u"       sandbox-tools-select-unmark-region "unmark region")
+    ("t"       sandbox-tools-select-toggle-region "toggle region")
     ("C-c C-c" sandbox-tools-select-confirm      "apply")
     ("C-c C-k" sandbox-tools-select-abort        "abort")
     ("q"       sandbox-tools-select-abort        nil))
@@ -364,11 +362,6 @@ is applied the overlay is discarded; otherwise it is kept."
   (add-hook 'tabulated-list-revert-hook #'sandbox-tools--sel-refresh nil t)
   (tabulated-list-init-header))
 
-(defun sandbox-tools--sel-group (hidden)
-  "Items whose `hidden' flag equals HIDDEN (t or nil)."
-  (seq-filter (lambda (item) (eq (sandbox-tools-item-hidden item) hidden))
-              sandbox-tools--sel-items))
-
 (defun sandbox-tools--sel-hints-row ()
   "A table row listing the main keys.  Its id is `hints'."
   (list 'hints
@@ -377,18 +370,6 @@ is applied the overlay is discarded; otherwise it is kept."
                              (concat (propertize key 'face 'help-key-binding) " " hint))
                            (seq-filter #'caddr sandbox-tools-select-keys)
                            "  "))))
-
-(defun sandbox-tools--sel-heading-row (hidden items)
-  "Heading row for the group of ITEMS.
-Its id is `hidden' if HIDDEN is non-nil, else `visible'."
-  (list (if hidden 'hidden 'visible)
-        (vector "" ""
-                (propertize
-                 (format "- %s — %d/%d selected (g toggles this group)"
-                         (if hidden "hidden paths (.git, dotfiles)" "project files")
-                         (seq-count #'sandbox-tools-item-selected items)
-                         (length items))
-                 'face 'sandbox-tools-group))))
 
 (defun sandbox-tools--sel-item-row (item)
   "Table row for ITEM.  Its id is ITEM itself."
@@ -399,14 +380,12 @@ Its id is `hidden' if HIDDEN is non-nil, else `visible'."
                   (propertize (sandbox-tools-item-path item) 'face face)))))
 
 (defun sandbox-tools--sel-refresh ()
-  "Redraw *sandbox apply*: key hints, project files, then hidden paths."
-  (setq tabulated-list-entries
-        (cons (sandbox-tools--sel-hints-row)
-              (cl-loop for hidden in '(nil t)
-                       for items = (sandbox-tools--sel-group hidden)
-                       when items
-                       collect (sandbox-tools--sel-heading-row hidden items)
-                       and append (mapcar #'sandbox-tools--sel-item-row items))))
+  "Redraw *sandbox apply*: key hints, visible rows, then hidden rows."
+  (let ((visible (seq-remove #'sandbox-tools-item-hidden sandbox-tools--sel-items))
+        (hidden  (seq-filter #'sandbox-tools-item-hidden sandbox-tools--sel-items)))
+    (setq tabulated-list-entries
+          (cons (sandbox-tools--sel-hints-row)
+                (mapcar #'sandbox-tools--sel-item-row (append visible hidden)))))
   (tabulated-list-print t))
 
 (defun sandbox-tools--sel-set (items value)
@@ -416,23 +395,12 @@ Its id is `hidden' if HIDDEN is non-nil, else `visible'."
   (sandbox-tools--sel-refresh))
 
 (defun sandbox-tools-select-toggle ()
-  "Toggle the item at point, or its whole group when on a heading."
+  "Toggle the item at point."
   (interactive)
   (let ((id (tabulated-list-get-id)))
-    (if (sandbox-tools-item-p id)
-        (sandbox-tools--sel-set (list id) (not (sandbox-tools-item-selected id)))
-      (sandbox-tools-select-toggle-group))))
-
-(defun sandbox-tools-select-toggle-group ()
-  "Toggle every item in the group at point."
-  (interactive)
-  (let* ((id (tabulated-list-get-id))
-         (hidden (cond ((sandbox-tools-item-p id) (sandbox-tools-item-hidden id))
-                       ((eq id 'hidden) t)
-                       ((eq id 'visible) nil)
-                       (t (user-error "Not on an item or group heading"))))
-         (items (sandbox-tools--sel-group hidden)))
-    (sandbox-tools--sel-set items (not (cl-every #'sandbox-tools-item-selected items)))))
+    (unless (sandbox-tools-item-p id)
+      (user-error "Not on a change row"))
+    (sandbox-tools--sel-set (list id) (not (sandbox-tools-item-selected id)))))
 
 (defun sandbox-tools-select-all ()
   "Select every item."
@@ -443,6 +411,48 @@ Its id is `hidden' if HIDDEN is non-nil, else `visible'."
   "Deselect every item."
   (interactive)
   (sandbox-tools--sel-set sandbox-tools--sel-items nil))
+
+(defun sandbox-tools--sel-region-items ()
+  "Return items on rows intersecting the active region."
+  (unless (use-region-p)
+    (user-error "No active region"))
+  (let ((end (region-end))
+        items)
+    (save-excursion
+      (goto-char (region-beginning))
+      (beginning-of-line)
+      (while (< (point) end)
+        (let ((id (tabulated-list-get-id)))
+          (when (sandbox-tools-item-p id)
+            (push id items)))
+        (forward-line 1)))
+    (nreverse items)))
+
+(defun sandbox-tools--sel-region-update (update)
+  "Apply UPDATE to selected items on the active region's rows."
+  (let ((items (sandbox-tools--sel-region-items)))
+    (unless items
+      (user-error "No change rows in region"))
+    (dolist (item items)
+      (setf (sandbox-tools-item-selected item)
+            (funcall update (sandbox-tools-item-selected item))))
+    (deactivate-mark)
+    (sandbox-tools--sel-refresh)))
+
+(defun sandbox-tools-select-mark-region ()
+  "Select every change row in the active region."
+  (interactive)
+  (sandbox-tools--sel-region-update (lambda (_) t)))
+
+(defun sandbox-tools-select-unmark-region ()
+  "Deselect every change row in the active region."
+  (interactive)
+  (sandbox-tools--sel-region-update (lambda (_) nil)))
+
+(defun sandbox-tools-select-toggle-region ()
+  "Invert selection for every change row in the active region."
+  (interactive)
+  (sandbox-tools--sel-region-update #'not))
 
 (defun sandbox-tools-select-confirm ()
   "Apply the selected items."
