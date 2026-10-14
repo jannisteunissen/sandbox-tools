@@ -489,10 +489,13 @@ is applied the overlay is discarded; otherwise it is kept."
     (delete-directory dir t)))
 
 (defun sandbox-tools--discard (root)
-  "Delete the overlay and staging data for ROOT."
+  "Delete sandbox files for ROOT, and sandbox path if empty."
   (sandbox-tools--check-idle root)
   (dolist (sub '("upper" "work" "staging" "tmp" "home"))
-    (sandbox-tools--delete-tree (sandbox-tools--path root sub))))
+    (sandbox-tools--delete-tree (sandbox-tools--path root sub)))
+  (let ((path (sandbox-tools--path root "")))
+    (when (directory-empty-p path)
+      (ignore-errors (sandbox-tools--delete-tree path)))))
 
 ;;;###autoload
 (defun sandbox-tools-reset ()
