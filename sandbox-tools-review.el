@@ -489,15 +489,14 @@ is applied the overlay is discarded; otherwise it is kept."
     (delete-directory dir t)))
 
 (defun sandbox-tools--discard (root)
-  "Delete the overlay and staging data for ROOT.  Keeps /tmp and HOME."
+  "Delete the overlay and staging data for ROOT."
   (sandbox-tools--check-idle root)
-  (dolist (sub '("upper" "work" "staging"))
+  (dolist (sub '("upper" "work" "staging" "tmp" "home"))
     (sandbox-tools--delete-tree (sandbox-tools--path root sub))))
 
 ;;;###autoload
 (defun sandbox-tools-reset ()
-  "Discard every change the sandbox made to the current project.
-The sandbox's /tmp and HOME are kept."
+  "Discard every change the sandbox made to the current project."
   (interactive)
   (let ((root (sandbox-tools-root)))
     (sandbox-tools--check-idle root)

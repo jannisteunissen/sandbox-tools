@@ -60,7 +60,7 @@ For each project, the module creates directories under
 - `staging/`: used internally for reviewing and applying changes.
 - `work/`: private scratch space required for overlayfs functionality
 
-`sandbox-tools-reset` removes `upper/`, `work/`, and `staging/`, but not `home/` and `tmp/`.
+`sandbox-tools-reset` removes `upper/`, `work/`, `staging/`, `home/` and `tmp/`.
 
 ### Sandbox permissions and environment
 
