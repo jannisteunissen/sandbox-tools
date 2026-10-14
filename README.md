@@ -1,23 +1,25 @@
 # sandbox-tools
 
-Run [gptel](https://github.com/karthink/gptel/) tools or other emacs commands
-in a Linux [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`)
-sandbox. Writes to the project are kept in an
-[overlay](https://en.wikipedia.org/wiki/OverlayFS) until you review and
-selectively apply them to the host file system.
+This package provides functionality to run emacs commands (such as
+[gptel](https://github.com/karthink/gptel/) tool calls) in a
+[bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) sandbox.
+Changes to files are stored in an
+[overlay](https://en.wikipedia.org/wiki/OverlayFS) and can afterwards be
+merged into the host file system.
 
 ## Requirements
 
 - `Emacs 29` or later.
-- `Linux >= 5.11` with user namespaces and overlayfs available
 - `bubblewrap` 0.9 or later, with overlayfs support
 - `rsync` for copying from/to the sandbox
-- `python3` for the `read_file` and `edit_file` tools in the sandbox
+
+Optional:
 - [gptel](https://github.com/karthink/gptel/) to use the included model tools
+- `python3` for the `read_file` and `edit_file` LLM tools in the sandbox
 
 ## Installation
 
-Place this directory somewhere and load it, for example:
+Place this directory somewhere and load it:
 
 ```elisp
 (add-to-list 'load-path "~/.emacs.d/lisp/sandbox-tools")
@@ -34,78 +36,65 @@ To bind the menu to a key use for example:
 (keymap-global-set "C-c s" #'sandbox-tools-menu)
 ```
 
-## How it works
+## Functionality
 
-### Project and scratch directories
+### Directories
 
-The project root is found from the `default-directory` of the current file:
-the nearest parent folder with a `.git` entry is looked up first; otherwise
-Emacs' current `project.el` root is used, and if this is not available
-`default-directory` itself is used. The path is resolved through symlinks.
+When a command or tool is called, the 'project' directory is found from the
+`default-directory` of the current file, in this order:
+
+1. The nearest parent folder with a `.git` entry
+2. Emacs' current `project.el` root (if available)
+3. `default-directory` itself is used
 
 For each project, the module creates directories under
-`sandbox-tools-scratch-dir`, whose default is `~/.emacs.d/sandbox/`. A
-project's directory name combines its basename and a hash of its path. The
-main entries are:
+`sandbox-tools-scratch-dir` (default: `~/.emacs.d/sandbox/`) of the form
+`<basename>-<hash>`. The main entries are:
 
-- `upper/`: the sandbox's pending changes. The project is mounted at
-  `/workspace` as an overlay. A file the sandbox creates or edits appears in
-  `upper/` at the same relative path. The real project is never touched.
-  Changes in `upper/` can be copied back through the `sandbox-tools-apply`
-  procedure described below.
-- `staging/`: a snapshot used for reviewing and applying changes.
+- `upper/`: the sandbox's pending changes. Inside the sandbox, the project is
+  mounted at `/workspace`. Files the sandbox creates or edits appear in
+  `upper/` at the same relative path. Changes in `upper/` can be copied back
+  through the `sandbox-tools-apply` method described below.
 - `home/` and `tmp/`: sandbox `/home/sandbox` and `/tmp`. These persist across
   tool calls for that project.
-- `work/`: private scratch space required for overlayfs functionality, does
-  not need to be inspected or modified.
+- `staging/`: used internally for reviewing and applying changes.
+- `work/`: private scratch space required for overlayfs functionality
 
-`sandbox-tools-reset` removes `upper/`, `work/`, and `staging/`, but leaves the
-sandbox HOME and `/tmp` in place.
+`sandbox-tools-reset` removes `upper/`, `work/`, and `staging/`, but not `home/` and `tmp/`.
 
 ### Sandbox permissions and environment
 
-Each tool command starts a fresh bubblewrap sandbox. The sandbox uses isolated
-namespaces and clears the environment, see `sandbox-tools--base-args` for
-details. The sandbox has a minimal `/dev` and `/proc` and read-only access to
-the host system paths in `sandbox-tools-ro-binds` (if they are present). A
-minimal default environment is defined in `sandbox-tools-env`, while the
-variables in `sandbox-tools-preserve-env` are preserved from the host shell.
-The project files are at `/workspace`. Writes appear in the overlay rather
-than the host project.
+Each tool or command starts a new bubblewrap sandbox, with the following properties:
 
-Network access is disabled by default. `run_command` can request the host
-network by passing `network: true`, which is only granted after approval.
-Approving shares the host network, including access to localhost.
+- Isolated namespaces (see `sandbox-tools--base-args`)
+- A cleared minimal environment (see `sandbox-tools-env). Only variables in
+  `sandbox-tools-preserve-env` are preserved from the host shell.
+- A minimal `/dev` and `/proc`
+- Read-only access to host paths in `sandbox-tools-ro-binds` (if defined)
+- Network access is disabled, but `run_command` can request it. Approving shares
+the host network, including access to localhost.
 
-### Adding writable mounts on host
-
-By default there are no writable host mounts. To add one, configure
-`sandbox-tools-cache-binds` as `(HOST-SRC . SANDBOX-DST)` pairs, for example:
+There are no writable host mounts, but they can be added via `sandbox-tools-cache-binds` as `(HOST-SRC . SANDBOX-DST)` pairs, for example:
 
 ```elisp
 (setq sandbox-tools-cache-binds
       '(("~/.cache/some-tool" . "/home/sandbox/.cache/some-tool")))
 ```
 
-These mounts are writable directly on the host and bypass overlay review and
-reset, so use with care!
-
 ## gptel tools
 
 Tool calls do not ask for confirmation, except for network acces.
 
-- **`run_command`** runs a Bash command from `/workspace`. Each call has a
+- **`run_command`** runs a Bash command from `/workspace`. Each call gets a
   fresh shell and environment. Commands are queued an execute sequentially per
-  project. Standard error is combined with standard output. If the output
-  exceeds `sandbox-tools-max-output`, it is stored in a temporary file (whose
-  name is given) and only the start and end of the output are returned.
-- **`read_file`** returns a text file's lines. Output is cut at a line
-  boundary after `sandbox-tools-max-read-output` bytes, with a note giving the
-  offset to continue from. Requires Python 3 in the sandbox.
-- **`write_file`** creates or overwrites a file in the project overlay. The
-  entire file contents should be passed.
-- **`edit_file`** replaces a literal block in a file in a somewhat robust manner.
-  Requires Python 3 in the sandbox.
+  project. Output is capped; when it exceeds `sandbox-tools-max-output`, it is
+  stored in a temporary file and only the start and end of the output are
+  returned.
+- **`read_file`** returns a text file's lines. Output is cut after
+  `sandbox-tools-max-read-output` bytes. Requires Python 3 in the sandbox.
+- **`write_file`** creates or overwrites a file in the project overlay.
+- **`edit_file`** replaces a literal block in a file. Requires Python 3 in the
+  sandbox.
 
 ## Reviewing, applying, and discarding changes
 
