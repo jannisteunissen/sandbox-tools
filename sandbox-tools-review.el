@@ -259,18 +259,38 @@ Return (STATUS . OUTPUT)."
       (delete-file list-file))))
 
 (defun sandbox-tools--delete-files (root files)
-  "Delete FILES, relative paths that may be directories, under ROOT."
-  (dolist (file files)
-    (let ((abs (expand-file-name file root)))
-      (cond ((file-directory-p abs) (delete-directory abs t))
-            ((file-exists-p abs) (delete-file abs))))))
+  "Delete selected FILES under ROOT without recursively deleting directories.
+Process children before parents.  Return directories retained because
+they are nonempty.  Symlinks are deleted without following them."
+  (let (retained)
+    (dolist (file (sort (copy-sequence files)
+                        (lambda (a b) (> (length a) (length b)))))
+      ;; Remove trailing slashes so directory symlinks are not followed.
+      (let ((abs (directory-file-name (expand-file-name file root))))
+        (cond
+         ((file-symlink-p abs) (delete-file abs))
+         ((file-directory-p abs)
+          (if (directory-empty-p abs)
+              (delete-directory abs)    ; Deliberately non-recursive.
+            (push file retained)))
+         ((file-exists-p abs) (delete-file abs)))))
+    (nreverse retained)))
 
 (defun sandbox-tools--modified-buffers-visiting (root files)
-  "Modified buffers under ROOT visiting one of FILES (relative paths)."
-  (let ((truenames (mapcar (lambda (file) (file-truename (expand-file-name file root)))
-                           files)))
-    (seq-filter (lambda (buf) (member (file-truename (buffer-file-name buf)) truenames))
-                (sandbox-tools--project-buffers root t))))
+  "Modified buffers visiting selected FILES or their directory descendants."
+  (let (exact dirs)
+    (dolist (file files)
+      (let* ((abs (directory-file-name (expand-file-name file root)))
+             (true (file-truename abs)))
+        (push true exact)
+        (when (and (not (file-symlink-p abs)) (file-directory-p abs))
+          (push (file-name-as-directory true) dirs))))
+    (seq-filter
+     (lambda (buf)
+       (let ((name (file-truename (buffer-file-name buf))))
+         (or (member name exact)
+             (seq-some (lambda (dir) (string-prefix-p dir name)) dirs))))
+     (sandbox-tools--project-buffers root t))))
 
 (defun sandbox-tools--confirm-deletions (deletions)
   "Ask whether to delete DELETIONS on the host."
@@ -279,30 +299,51 @@ Return (STATUS . OUTPUT)."
                        (string-join (seq-take deletions 5) ", ")
                        (if (> (length deletions) 5) ", …" ""))))
 
+(defun sandbox-tools--stale-p (root staging)
+  "Non-nil if the overlay of ROOT changed since STAGING was snapshotted."
+  (pcase-let ((`(,status . ,output)
+               (sandbox-tools--capture
+                 (sandbox-tools--review root staging
+                                        "rsync" "-ni" "-aH" "--delete" "--safe-links"
+                                        "/merged/" "/staging/"))))
+    (or (not (sandbox-tools--exit-ok-p status))
+        ;; Ignore non-itemized lines such as unsafe-symlink warnings.
+        (seq-some #'sandbox-tools--item (split-string output "\n" t)))))
+
 (defun sandbox-tools--apply-plan (root staging items)
-  "Phase 2: apply the selected ITEMS from STAGING to ROOT.
-If every item was selected, discard the overlay afterwards."
+  "Apply selected ITEMS from STAGING to ROOT.
+Preserve nonempty directories and retain the overlay unless every item
+was selected and all selected deletions completed."
+  (sandbox-tools--check-idle root)
   (let* ((changes   (sandbox-tools--selected-paths items 'change))
          (deletions (sandbox-tools--selected-paths items 'delete))
          (conflicts (sandbox-tools--modified-buffers-visiting
                      root (append changes deletions))))
     (when conflicts
-      (user-error "Refusing to apply: modified buffer(s) visit selected \
-files: %s (save or revert first)"
-                  (mapconcat #'buffer-name conflicts ", ")))
+      (user-error
+       "Refusing to apply: modified buffers visit selected files or directories: %s"
+       (mapconcat #'buffer-name conflicts ", ")))
     (when (and deletions (not (sandbox-tools--confirm-deletions deletions)))
       (user-error "Aborted; overlay retained"))
-    (sandbox-tools--delete-files root deletions)
-    (when changes
-      (sandbox-tools--step "Apply (phase 2)"
-                           (sandbox-tools--copy-files staging root changes)))
-    (sandbox-tools--revert-project-buffers root)
-    (if (cl-every #'sandbox-tools-item-selected items)
-        (progn
-          (sandbox-tools--discard root)
-          (message "Applied all sandbox changes to %s" root))
-      (message "Applied %d change(s) to %s; overlay retained"
-               (+ (length changes) (length deletions)) root))))
+    ;; Confirmation can wait for input; check again afterwards.
+    (sandbox-tools--check-idle root)
+    (when (sandbox-tools--stale-p root staging)
+      (user-error "Sandbox changed since the snapshot; run apply again"))
+    (let ((retained (sandbox-tools--delete-files root deletions)))
+      (when changes
+        (sandbox-tools--step "Apply (phase 2)"
+                             (sandbox-tools--copy-files staging root changes)))
+      (sandbox-tools--revert-project-buffers root)
+      (cond
+       (retained
+        (message "Applied selected changes; retained %d nonempty director%s; overlay retained"
+                 (length retained) (if (= (length retained) 1) "y" "ies")))
+       ((cl-every #'sandbox-tools-item-selected items)
+        (sandbox-tools--discard root)
+        (message "Applied all sandbox changes to %s" root))
+       (t
+        (message "Applied %d change(s) to %s; overlay retained"
+                 (+ (length changes) (length deletions)) root))))))
 
 ;;;###autoload
 (defun sandbox-tools-apply ()
@@ -488,35 +529,41 @@ is applied the overlay is discarded; otherwise it is kept."
     (call-process "chmod" nil nil nil "-R" "u+rwX" "--" dir)
     (delete-directory dir t)))
 
-(defun sandbox-tools--discard (root)
-  "Delete sandbox files for ROOT, and sandbox path if empty."
+(defun sandbox-tools--discard (root &optional remove-runtime)
+  "Discard workspace changes for ROOT.
+If REMOVE-RUNTIME is non-nil, also remove the sandbox's HOME and /tmp.
+Remove the project's scratch directory if it becomes empty."
   (sandbox-tools--check-idle root)
-  (dolist (sub '("upper" "work" "staging" "tmp" "home"))
+  (dolist (sub (append '("upper" "work" "staging")
+                      (when remove-runtime '("tmp" "home"))))
     (sandbox-tools--delete-tree (sandbox-tools--path root sub)))
   (let ((path (sandbox-tools--path root "")))
-    (when (directory-empty-p path)
+    (when (and (file-directory-p path)
+               (directory-empty-p path))
       (ignore-errors (sandbox-tools--delete-tree path)))))
 
 ;;;###autoload
 (defun sandbox-tools-reset ()
-  "Discard every change the sandbox made to the current project."
+  "Discard workspace changes for the current project.
+Ask separately whether to remove the sandbox's HOME and /tmp, which
+can contain installed software, caches and command output."
   (interactive)
   (let ((root (sandbox-tools-root)))
     (sandbox-tools--check-idle root)
-    (when (yes-or-no-p "Discard all sandbox changes? ")
-      (sandbox-tools--discard root)
-      (sandbox-tools--revert-project-buffers root)
-      (message "Discarded sandbox changes for %s" root))))
+    (when (yes-or-no-p "Discard all sandbox workspace changes? ")
+      (let ((remove-runtime
+             (yes-or-no-p
+              "Also remove sandbox HOME and /tmp (installed software, caches, output)? ")))
+        (sandbox-tools--discard root remove-runtime)
+        (sandbox-tools--revert-project-buffers root)
+        (message "Discarded sandbox workspace changes; HOME and /tmp %s"
+                 (if remove-runtime "removed" "preserved"))))))
 
 ;;;###autoload
 (defun sandbox-tools-interrupt ()
-  "Kill the sandbox commands running for the current project."
+  "Cancel queued and running sandbox commands for the current project."
   (interactive)
-  (let* ((root (sandbox-tools-root))
-         (procs (sandbox-tools--processes root)))
-    (mapc #'delete-process procs)
-    (message "%d sandbox command(s) killed for %s"
-             (length procs) (abbreviate-file-name root))))
+  (call-interactively #'sandbox-tools-cancel))
 
 ;;;###autoload
 (defun sandbox-tools-status ()
