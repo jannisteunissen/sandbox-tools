@@ -64,11 +64,11 @@ An async gptel tool must always call its callback, or the request hangs."
  :name "run_command" :category "sandbox" :async t :include t :confirm nil
  :description "Run a bash command in a sandbox (cwd: /workspace, the project root).
 
-- Edit files with `write_file'/`edit_file', not redirection or sed -i.
-- cwd/env reset each call (use `cd dir && …`); /tmp persists.
-- Minimal env; no network unless `network' is true.
-- stderr merged into stdout; long output is truncated (head+tail),
-  so prefer grep/head/tail/wc/sed -n over dumping files.
+- Edit files with `write_file'/`edit_file'.
+- cwd resets each call to /workspace (use `cd dir && …` for other paths);
+- /tmp persists.
+- Minimal env; resets each call; no network unless `network' is true.
+- stderr is merged into stdout; long output is truncated (head+tail)
 - Batch independent calls in one response; they run in order."
  :args '((:name "command" :type string
                 :description "Bash command line.")
