@@ -57,10 +57,9 @@ For each project, the module creates directories under
   through the `sandbox-tools-apply` method described below.
 - `home/` and `tmp/`: sandbox `/home/sandbox` and `/tmp`. These persist across
   tool calls for that project.
-- `staging/`: used internally for reviewing and applying changes.
 - `work/`: private scratch space required for overlayfs functionality
 
-`sandbox-tools-reset` removes `upper/`, `work/`, `staging/`, `home/` and `tmp/`.
+`sandbox-tools-reset` removes `upper/`, `work/`, `home/` and `tmp/`.
 
 ### Sandbox permissions and environment
 

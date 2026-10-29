@@ -124,7 +124,7 @@ size is capped by `sandbox-tools-hard-output-limit' instead."
   :type 'natnum)
 
 (defcustom sandbox-tools-scratch-dir (locate-user-emacs-file "sandbox/")
-  "Directory holding each project's overlay, staging area, /tmp and HOME.
+  "Directory holding each project's overlay, /tmp and HOME.
 It must be on a filesystem that supports user.* xattrs (ext4, xfs,
 btrfs); overlayfs fails on tmpfs and some network filesystems."
   :type 'directory)

@@ -8,11 +8,6 @@
 
 ;; Commands to show, apply and discard what sandboxed commands wrote to
 ;; the project overlay, plus status, interrupt and a menu.
-;;
-;; Applying happens in two phases, so the real project is never written
-;; while it is mounted as an overlay layer:
-;;   1. inside bwrap, rsync the merged overlay to a staging directory;
-;;   2. outside bwrap, copy the selected files from staging to the project.
 
 ;;; Code:
 
@@ -26,6 +21,21 @@ Changes under them are still listed and can be applied."
   :type '(repeat string)
   :group 'sandbox-tools)
 
+(defcustom sandbox-tools-diff-max-file-size (* 1024 1024)
+  "Files larger than this many bytes are listed but not diffed."
+  :type 'integer
+  :group 'sandbox-tools)
+
+(defcustom sandbox-tools-diff-max-output (* 20 1024 1024)
+  "Truncate the *sandbox diff* patch text after this many bytes."
+  :type 'integer
+  :group 'sandbox-tools)
+
+(defcustom sandbox-tools-diff-font-lock-size (* 2 1024 1024)
+  "Disable `diff-mode' font-lock and refinement above this buffer size."
+  :type 'integer
+  :group 'sandbox-tools)
+
 ;;;; Helpers
 
 (defmacro sandbox-tools--capture (&rest body)
@@ -33,17 +43,16 @@ Changes under them are still listed and can be applied."
   (declare (indent 0))
   `(with-temp-buffer (cons (progn ,@body) (buffer-string))))
 
-(defun sandbox-tools--review (root staging &rest command)
+(defun sandbox-tools--review (root &rest command)
   "Run COMMAND in a sandbox that shows project ROOT twice, read-only.
 /real is the project as it is on the host; /merged is the project with
-the sandbox's changes on top.  If STAGING is non-nil, it is writable at
-/staging.  Output goes to the current buffer.  Return the exit status."
+the sandbox's changes on top.  Output goes to the current buffer.
+Return the exit status."
   (sandbox-tools--check-idle root)
   (let ((real (directory-file-name root)))
     (apply #'call-process "bwrap" nil t nil
            `(,@(sandbox-tools--base-args)
              "--ro-bind" ,real "/real"
-             ,@(when staging `("--bind" ,staging "/staging"))
              ;; The last --overlay-src is the top layer.
              "--overlay-src" ,real
              "--overlay-src" ,(sandbox-tools--dir root "upper")
@@ -118,11 +127,12 @@ Return nil if LINE names no path."
 ;;;; Diff
 
 (defun sandbox-tools--summary (root)
-  "Return rsync's list of changes for ROOT, hidden paths last.
-This shows changes `diff' cannot, such as empty files, modes and deletions."
+  "Return rsync's list of changes for ROOT as itemized line strings.
+This shows changes `diff' cannot, such as empty files, modes and
+deletions.  Lines for hidden paths are moved to the end."
   (pcase-let ((`(,status . ,output)
                (sandbox-tools--capture
-                 (sandbox-tools--review root nil
+                 (sandbox-tools--review root
                                         "rsync" "-ni" "-aH" "--delete" "--safe-links"
                                         "/merged/" "/real/"))))
     (unless (sandbox-tools--exit-ok-p status)
@@ -140,59 +150,89 @@ This shows changes `diff' cannot, such as empty files, modes and deletions."
                      (sandbox-tools--hidden-p (car (sandbox-tools--item line))))))
       (append (seq-remove hidden lines) (seq-filter hidden lines)))))
 
-(defun sandbox-tools--insert-diff (root)
-  "Insert a unified diff of the sandbox changes for ROOT at point."
-  (let ((status (apply #'sandbox-tools--review root nil
-                       "diff" "-ruN"
-                       (append (mapcan (lambda (dir) (list "-x" dir))
-                                       sandbox-tools-review-exclude)
-                               '("/real" "/merged")))))
-    ;; diff exits with 1 when the files differ.
-    (unless (sandbox-tools--exit-ok-p status 1)
-      (error "Failed to generate sandbox diff: %s"
-             (if (stringp status) status (string-trim (buffer-string))))))
-  (replace-regexp-in-region "^\\(---\\|\\+\\+\\+\\) /real/" "\\1 a/" (point-min))
-  (replace-regexp-in-region "^\\(---\\|\\+\\+\\+\\) /merged/" "\\1 b/" (point-min)))
+(defconst sandbox-tools--diff-script "
+max=$1; limit=$2; shift 2
+for f; do
+  r=/real/$f; m=/merged/$f
+  { [ -d \"$m\" ] || [ -d \"$r\" ]; } && continue
+  s=$(stat -c %s -- \"$m\" 2>/dev/null || echo 0)
+  t=$(stat -c %s -- \"$r\" 2>/dev/null || echo 0)
+  if [ \"$s\" -gt \"$max\" ] || [ \"$t\" -gt \"$max\" ]; then
+    echo \"# $f: not diffed ($t -> $s bytes)\"; continue
+  fi
+  diff -uN --label \"a/$f\" --label \"b/$f\" -- \"$r\" \"$m\"
+  [ $? -le 1 ] || echo \"# $f: diff failed\"
+done | head -c \"$limit\"
+"
+  "Shell script that diffs each path passed as a positional argument.
+First two arguments are the size limit per file and the total limit.")
+
+(defun sandbox-tools--diff-paths (summary)
+  "Relative paths named by SUMMARY, minus `sandbox-tools-review-exclude'."
+  (seq-remove
+   (lambda (path)
+     (seq-some (lambda (part) (member part sandbox-tools-review-exclude))
+               (split-string path "/" t)))
+   (mapcar (lambda (line) (car (sandbox-tools--item line))) summary)))
+
+(defun sandbox-tools--insert-diff (root summary)
+  "Insert a size-limited unified diff of the files in SUMMARY at point."
+  (let ((paths (sandbox-tools--diff-paths summary)))
+    (when paths
+      ;; If you routinely exceed a few thousand files, feed PATHS on
+      ;; stdin instead: ARG_MAX caps a single command line at ~2MB.
+      (apply #'sandbox-tools--review root
+             "sh" "-c" sandbox-tools--diff-script "sh"
+             (number-to-string sandbox-tools-diff-max-file-size)
+             (number-to-string sandbox-tools-diff-max-output)
+             paths)
+      (when (>= (buffer-size) sandbox-tools-diff-max-output)
+        (insert "\n# ... diff truncated\n")))))
 
 (defvar-keymap sandbox-tools-diff-mode-map
   :doc "Extra bindings in *sandbox diff*, on top of `diff-mode'."
   "q" #'quit-window)
 
-(defun sandbox-tools--diff (root)
-  "Fill the *sandbox diff* buffer for ROOT.
+(defun sandbox-tools--diff (root summary)
+  "Fill the *sandbox diff* buffer for ROOT from SUMMARY.
 Return non-nil if there are changes."
-  (let ((summary (sandbox-tools--summary root)))
-    (with-current-buffer (get-buffer-create "*sandbox diff*")
-      (let ((inhibit-read-only t))
-        (remove-overlays)
-        (erase-buffer)
-        (sandbox-tools--insert-diff root)
-        (let ((changed (or summary (> (buffer-size) 0))))
-          (goto-char (point-min))
-          ;; diff-mode ignores lines starting with "#".
-          (when summary
-            (insert "# staged changes (rsync preview)\n"
-                    (mapconcat (lambda (line) (concat "#   " line)) summary "\n")
-                    "\n\n"))
-          (unless changed
-            (insert "No sandbox changes.\n"))
-          (diff-mode)
-          (use-local-map (make-composed-keymap sandbox-tools-diff-mode-map
-                                               (current-local-map)))
-          (setq header-line-format
-                (substitute-command-keys
-                 "\\<sandbox-tools-diff-mode-map>\\[quit-window] quit"))
-          (setq buffer-read-only t)
-          (goto-char (point-min))
-          changed)))))
+  (with-current-buffer (get-buffer-create "*sandbox diff*")
+    (let ((inhibit-read-only t)
+          changed)
+      (remove-overlays)
+      (erase-buffer)
+      (sandbox-tools--insert-diff root summary)
+      (setq changed (or summary (> (buffer-size) 0)))
+      (goto-char (point-min))
+      ;; diff-mode ignores lines starting with "#".
+      (when summary
+        (insert "# staged changes (rsync preview)\n"
+                (mapconcat (lambda (line) (concat "#   " line)) summary "\n")
+                "\n\n"))
+      (unless changed
+        (insert "No sandbox changes.\n"))
+      (diff-mode)
+      (when (> (buffer-size) sandbox-tools-diff-font-lock-size)
+        (setq-local diff-refine nil
+                    diff-font-lock-syntax nil)
+        (font-lock-mode -1))
+      (use-local-map (make-composed-keymap sandbox-tools-diff-mode-map
+                                           (current-local-map)))
+      (setq header-line-format
+            (substitute-command-keys
+             "\\<sandbox-tools-diff-mode-map>\\[quit-window] quit"))
+      (setq buffer-read-only t)
+      (goto-char (point-min))
+      changed)))
 
 ;;;###autoload
 (defun sandbox-tools-diff ()
   "Show what the sandbox changed.  Return non-nil if anything changed."
   (interactive)
   (sandbox-tools--check-programs "bwrap" "rsync")
-  (prog1 (sandbox-tools--diff (sandbox-tools-root))
-    (pop-to-buffer "*sandbox diff*")))
+  (let ((root (sandbox-tools-root)))
+    (prog1 (sandbox-tools--diff root (sandbox-tools--summary root))
+      (pop-to-buffer "*sandbox diff*"))))
 
 ;;;; Apply
 
@@ -203,30 +243,13 @@ Return non-nil if there are changes."
   hidden     ; non-nil for paths like .git/...
   selected)  ; non-nil if the user chose to apply it
 
-(defun sandbox-tools--snapshot (root staging)
-  "Phase 1: copy the merged project to STAGING.  Return (STATUS . OUTPUT)."
-  (sandbox-tools--capture
-    (sandbox-tools--review root staging
-                           "rsync" "-aH" "--delete" "--safe-links"
-                           "/merged/" "/staging/")))
-
-(defun sandbox-tools--list-changes (root staging)
-  "List what copying STAGING over ROOT would do, as rsync -i output.
-Return (STATUS . OUTPUT)."
-  (sandbox-tools--capture
-    (call-process "rsync" nil t nil
-                  "-n" "-aHi" "--delete" "--safe-links"
-                  (file-name-as-directory staging)
-                  (file-name-as-directory root))))
-
-(defun sandbox-tools--build-plan (rsync-output)
-  "Turn RSYNC-OUTPUT into a list of `sandbox-tools-item'.
+(defun sandbox-tools--build-plan (summary)
+  "Turn SUMMARY, a list of rsync -i lines, into `sandbox-tools-item's.
 Changed directories are left out, since copying their files creates them.
 Hidden paths start out unselected."
   (let (items)
     (pcase-dolist (`(,path . ,kind)
-                   (delq nil (mapcar #'sandbox-tools--item
-                                     (split-string rsync-output "\n" t))))
+                   (delq nil (mapcar #'sandbox-tools--item summary)))
       (unless (and (eq kind 'change) (string-suffix-p "/" path))
         (let ((hidden (sandbox-tools--hidden-p path)))
           (push (sandbox-tools-item--make :path path :kind kind
@@ -241,8 +264,8 @@ Hidden paths start out unselected."
                      (eq (sandbox-tools-item-kind item) kind))
            collect (sandbox-tools-item-path item)))
 
-(defun sandbox-tools--copy-files (staging root files)
-  "Copy FILES, relative paths, from STAGING to ROOT.
+(defun sandbox-tools--copy-files (root files)
+  "Copy FILES, relative paths, from ROOT's overlay upper dir to ROOT.
 Return (STATUS . OUTPUT)."
   (let ((list-file (make-temp-file "sandbox-tools-files")))
     (unwind-protect
@@ -254,7 +277,7 @@ Return (STATUS . OUTPUT)."
             (call-process "rsync" nil t nil
                           "-aHi" "--safe-links" "--from0"
                           (concat "--files-from=" list-file)
-                          (file-name-as-directory staging)
+                          (file-name-as-directory (sandbox-tools--dir root "upper"))
                           (file-name-as-directory root))))
       (delete-file list-file))))
 
@@ -299,19 +322,12 @@ they are nonempty.  Symlinks are deleted without following them."
                        (string-join (seq-take deletions 5) ", ")
                        (if (> (length deletions) 5) ", …" ""))))
 
-(defun sandbox-tools--stale-p (root staging)
-  "Non-nil if the overlay of ROOT changed since STAGING was snapshotted."
-  (pcase-let ((`(,status . ,output)
-               (sandbox-tools--capture
-                 (sandbox-tools--review root staging
-                                        "rsync" "-ni" "-aH" "--delete" "--safe-links"
-                                        "/merged/" "/staging/"))))
-    (or (not (sandbox-tools--exit-ok-p status))
-        ;; Ignore non-itemized lines such as unsafe-symlink warnings.
-        (seq-some #'sandbox-tools--item (split-string output "\n" t)))))
+(defun sandbox-tools--stale-p (root summary)
+  "Non-nil if the sandbox changes of ROOT differ from SUMMARY."
+  (not (equal summary (sandbox-tools--summary root))))
 
-(defun sandbox-tools--apply-plan (root staging items)
-  "Apply selected ITEMS from STAGING to ROOT.
+(defun sandbox-tools--apply-plan (root summary items)
+  "Apply selected ITEMS of ROOT, whose plan was built from SUMMARY.
 Preserve nonempty directories and retain the overlay unless every item
 was selected and all selected deletions completed."
   (sandbox-tools--check-idle root)
@@ -327,12 +343,12 @@ was selected and all selected deletions completed."
       (user-error "Aborted; overlay retained"))
     ;; Confirmation can wait for input; check again afterwards.
     (sandbox-tools--check-idle root)
-    (when (sandbox-tools--stale-p root staging)
-      (user-error "Sandbox changed since the snapshot; run apply again"))
+    (when (sandbox-tools--stale-p root summary)
+      (user-error "Sandbox changed since the review; run apply again"))
     (let ((retained (sandbox-tools--delete-files root deletions)))
       (when changes
-        (sandbox-tools--step "Apply (phase 2)"
-                             (sandbox-tools--copy-files staging root changes)))
+        (sandbox-tools--step "Apply"
+                             (sandbox-tools--copy-files root changes)))
       (sandbox-tools--revert-project-buffers root)
       (cond
        (retained
@@ -353,19 +369,15 @@ is applied the overlay is discarded; otherwise it is kept."
   (interactive)
   (sandbox-tools--check-programs "bwrap" "rsync")
   (let ((root (sandbox-tools-root)))
-    (unless (sandbox-tools--diff root)
-      (user-error "No sandbox changes to apply"))
-    (pop-to-buffer "*sandbox diff*")
-    (let ((staging (sandbox-tools--dir root "staging")))
-      (sandbox-tools--step "Snapshot (phase 1)"
-                           (sandbox-tools--snapshot root staging))
-      (let ((items (sandbox-tools--build-plan
-                    (sandbox-tools--step "Listing changes"
-                                         (sandbox-tools--list-changes root staging)))))
+    (let ((summary (sandbox-tools--summary root)))
+      (unless (sandbox-tools--diff root summary)
+        (user-error "No sandbox changes to apply"))
+      (pop-to-buffer "*sandbox diff*")
+      (let ((items (sandbox-tools--build-plan summary)))
         (unless items
           (sandbox-tools--discard root)
           (user-error "Nothing to apply"))
-        (sandbox-tools--select root staging items)))))
+        (sandbox-tools--select root summary items)))))
 
 ;;;; Selection buffer
 
@@ -375,7 +387,7 @@ is applied the overlay is discarded; otherwise it is kept."
 
 (defvar-local sandbox-tools--sel-items nil "Items shown in *sandbox apply*.")
 (defvar-local sandbox-tools--sel-root nil "Project root for *sandbox apply*.")
-(defvar-local sandbox-tools--sel-staging nil "Staging directory for *sandbox apply*.")
+(defvar-local sandbox-tools--sel-summary nil "Summary for *sandbox apply*.")
 
 (defconst sandbox-tools-select-keys
   '(("SPC"     sandbox-tools-select-toggle       "toggle")
@@ -499,12 +511,12 @@ is applied the overlay is discarded; otherwise it is kept."
   "Apply the selected items."
   (interactive)
   (let ((root sandbox-tools--sel-root)
-        (staging sandbox-tools--sel-staging)
+        (summary sandbox-tools--sel-summary)
         (items sandbox-tools--sel-items))
     (unless (seq-some #'sandbox-tools-item-selected items)
       (user-error "Nothing selected"))
     (quit-window t)
-    (sandbox-tools--apply-plan root staging items)))
+    (sandbox-tools--apply-plan root summary items)))
 
 (defun sandbox-tools-select-abort ()
   "Close the selection without applying anything."
@@ -512,12 +524,12 @@ is applied the overlay is discarded; otherwise it is kept."
   (quit-window t)
   (message "Aborted; overlay retained"))
 
-(defun sandbox-tools--select (root staging items)
-  "Let the user choose which ITEMS to apply from STAGING to ROOT."
+(defun sandbox-tools--select (root summary items)
+  "Let the user choose which ITEMS from SUMMARY to apply to ROOT."
   (pop-to-buffer (get-buffer-create "*sandbox apply*"))
   (sandbox-tools-select-mode)
   (setq sandbox-tools--sel-root root
-        sandbox-tools--sel-staging staging
+        sandbox-tools--sel-summary summary
         sandbox-tools--sel-items items)
   (sandbox-tools--sel-refresh))
 
@@ -534,7 +546,7 @@ is applied the overlay is discarded; otherwise it is kept."
 If REMOVE-RUNTIME is non-nil, also remove the sandbox's HOME and /tmp.
 Remove the project's scratch directory if it becomes empty."
   (sandbox-tools--check-idle root)
-  (dolist (sub (append '("upper" "work" "staging")
+  (dolist (sub (append '("upper" "work")
                       (when remove-runtime '("tmp" "home"))))
     (sandbox-tools--delete-tree (sandbox-tools--path root sub)))
   (let ((path (sandbox-tools--path root "")))
