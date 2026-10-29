@@ -53,12 +53,38 @@ An async gptel tool must always call its callback, or the request hangs."
 
 ;;;; run_command
 
+(defcustom sandbox-tools-confirm-network t
+  "Whether to ask before running a command with network access.
+If nil, network commands run without confirmation."
+  :type 'boolean
+  :group 'sandbox-tools)
+
+(defvar sandbox-tools--network-always-allowed nil
+  "Non-nil if the user chose to allow network access for this session.")
+
+(defun sandbox-tools-reset-network-approval ()
+  "Ask again before running network commands."
+  (interactive)
+  (setq sandbox-tools--network-always-allowed nil)
+  (message "sandbox-tools: network commands will require approval again"))
+
 (defun sandbox-tools--confirm-network (command)
-  "Ask the user whether COMMAND may run with network access."
-  (yes-or-no-p
-   (format "Sandbox [NETWORK — host net & localhost!]: run `%s'? "
-           (truncate-string-to-width
-            (replace-regexp-in-string "\n" "⏎" command) 120 nil nil "…"))))
+  "Ask the user whether COMMAND may run with network access.
+Choosing \"always\" skips the prompt for the rest of the session."
+  (or (not sandbox-tools-confirm-network)
+      sandbox-tools--network-always-allowed
+      (pcase (car (read-multiple-choice
+                   (format "Sandbox [NETWORK — host net & localhost!]: run `%s'? "
+                           (truncate-string-to-width
+                            (replace-regexp-in-string "\n" "⏎" command)
+                            120 nil nil "…"))
+                   '((?y "yes" "Run this command with network access")
+                     (?n "no" "Deny network access for this command")
+                     (?a "always" "Allow network access without asking \
+for the rest of this session"))))
+        (?y t)
+        (?a (setq sandbox-tools--network-always-allowed t))
+        (_ nil))))
 
 (gptel-make-tool
  :name "run_command" :category "sandbox" :async t :include t :confirm nil
